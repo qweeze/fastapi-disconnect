@@ -1,5 +1,14 @@
 # fastapi-disconnect
 
+<p>
+<a href="https://pypi.org/project/fastapi-disconnect">
+    <img src="https://img.shields.io/pypi/v/fastapi-disconnect?color=%2334D058&label=pypi%20package" alt="Package version">
+</a>
+<a href="https://pypi.org/project/fastapi-disconnect">
+    <img src="https://img.shields.io/pypi/pyversions/fastapi-disconnect.svg?color=%2334D058" alt="Supported Python versions">
+</a>
+</p>
+
 Cancel FastAPI request handlers when the client disconnects.
 
 By default, when a client disconnects (timeout, closed tab, network failure),
