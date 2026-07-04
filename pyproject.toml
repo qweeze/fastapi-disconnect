@@ -28,7 +28,7 @@ Repository = "https://github.com/qweeze/fastapi-disconnect"
 
 [dependency-groups]
 dev = [
-    "fastapi>=0.115",
+    "fastapi>=0.115.3",  # first release compatible with starlette>=0.40
     "uvicorn>=0.30",
     "pytest>=8.0",
     "mypy>=1.14",

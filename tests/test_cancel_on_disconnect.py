@@ -5,7 +5,7 @@ from typing import Any
 
 import anyio
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
@@ -426,6 +426,99 @@ async def test_middleware_on_disconnect_callback() -> None:
     async with asyncio.timeout(2):
         await app2(http_scope(path="/slow"), receive, send)
     assert seen_sync == ["/slow"]
+
+
+async def test_decorator_reuses_declared_request_param() -> None:
+    """A handler that declares its own `Request` still gets it, and the
+    guard uses that one instead of injecting a second (FastAPI would inject
+    into only one Request parameter, starving the other)."""
+    cancelled = asyncio.Event()
+    seen: list[str] = []
+    app = FastAPI()
+
+    @app.get("/")
+    @cancel_on_disconnect
+    async def handler(request: Request) -> str:
+        seen.append(request.url.path)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "OK"
+
+    sent, send = collector()
+    receive = scripted_receive([(0, body_message()), (0.05, DISCONNECT)])
+    async with asyncio.timeout(2):
+        await app(http_scope(), receive, send)
+
+    assert seen == ["/"]
+    assert cancelled.is_set()
+    assert sent[0]["status"] == 499
+
+
+async def test_decorator_supports_var_kwargs() -> None:
+    """Decorating a **kwargs handler must not crash (the synthetic param is
+    inserted before VAR_KEYWORD) and must not change FastAPI's own behavior:
+    FastAPI treats **kwargs as a required query field and 422s either way."""
+    app = FastAPI()
+
+    @app.get("/")
+    @cancel_on_disconnect
+    async def handler(**kwargs: Any) -> str:
+        return "ok"
+
+    assert await handler(anything="x") == "ok"  # direct call still works
+
+    sent, send = collector()
+    receive = scripted_receive([(0, body_message())])
+    async with asyncio.timeout(2):
+        await app(http_scope(), receive, send)
+
+    # Identical to what FastAPI returns for an undecorated **kwargs endpoint.
+    assert sent[0]["status"] == 422
+
+
+def test_decorator_rejects_reserved_param_name() -> None:
+    with pytest.raises(TypeError, match="reserved"):
+
+        @cancel_on_disconnect
+        async def handler(__cancel_on_disconnect_request: str) -> str:
+            return "ok"
+
+
+async def test_middleware_bounded_queue() -> None:
+    """queue_size bounds body buffering; bodies and cancellation still work."""
+    cancelled = asyncio.Event()
+    app = FastAPI()
+    app.add_middleware(CancelOnDisconnectMiddleware, queue_size=1)
+
+    @app.post("/echo")
+    async def echo(data: dict[str, Any]) -> dict[str, Any]:
+        return data
+
+    @app.post("/slow")
+    async def slow(data: dict[str, Any]) -> str:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "OK"
+
+    payload = b'{"a": 1}'
+    sent, send = collector()
+    receive = scripted_receive([(0, body_message(payload))])
+    async with asyncio.timeout(2):
+        await app(http_scope("POST", "/echo", body=payload), receive, send)
+    assert sent[0]["status"] == 200
+    assert json.loads(sent[1]["body"]) == {"a": 1}
+
+    sent, send = collector()
+    receive = scripted_receive([(0, body_message(payload)), (0.05, DISCONNECT)])
+    async with asyncio.timeout(2):
+        await app(http_scope("POST", "/slow", body=payload), receive, send)
+    assert cancelled.is_set()
 
 
 async def test_decorator_direct_call_runs_unguarded() -> None:

@@ -37,6 +37,7 @@ app.add_middleware(
     CancelOnDisconnectMiddleware,
     exclude_paths=[r"/uploads/.*"],   # optional; re.fullmatch against the path
     on_disconnect=log_cancellation,   # optional; sync or async, gets the ASGI scope
+    queue_size=64,                    # optional; bounds body buffering (default: unbounded)
 )
 ```
 
@@ -111,6 +112,25 @@ it detaches the inner call, but the awaiting handler is still re-cancelled, so
 the cleanup continues without you.) Synchronous cleanup needs no shielding.
 Re-raise after cleaning up — a handler that swallows the cancellation and
 returns a value is treated as having completed normally.
+
+## Caveats
+
+- **asyncio only**
+- **Don't read the raw body (`request.body()` / `request.stream()`) inside a
+  guarded handler** — the disconnect watcher owns the receive channel while
+  the handler runs. FastAPI-parsed body params are fine, and under the
+  middleware raw reads work normally.
+- **The decorator guards only the handler** — dependencies and request
+  parsing have already run when it starts, and a returned `StreamingResponse`
+  body runs after it exits (the decorator warns). Use the middleware to cover
+  the whole request lifecycle. Sync (`def`) handlers can't be cancelled and
+  are rejected with `TypeError`.
+- **The middleware buffers request bodies eagerly by default** — set
+  `queue_size` to restore upload backpressure (disconnect detection pauses
+  while the queue is full), exclude upload routes, or limit request size
+  upstream.
+- **Proxies can hide disconnects** — behind a buffering proxy (nginx, ALB)
+  the `http.disconnect` event may arrive late or never.
 
 ## License
 
