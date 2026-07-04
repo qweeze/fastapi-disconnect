@@ -6,7 +6,7 @@ import math
 import re
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
-from typing import Annotated, Any
+from typing import Annotated, Any, get_args, get_origin
 
 import anyio
 from starlette.requests import Request
@@ -101,6 +101,12 @@ async def _scope_cancelled_when(
                 await watcher
 
 
+def _is_request_annotation(annotation: Any) -> bool:
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    return isinstance(annotation, type) and issubclass(annotation, Request)
+
+
 def cancel_on_disconnect[**P, R](
     handler: Callable[P, Coroutine[Any, Any, R]],
 ) -> Callable[P, Coroutine[Any, Any, R | Response]]:
@@ -137,7 +143,7 @@ def cancel_on_disconnect[**P, R](
         (
             name
             for name, param in signature.parameters.items()
-            if isinstance(param.annotation, type) and issubclass(param.annotation, Request)
+            if _is_request_annotation(param.annotation)
         ),
         None,
     )
@@ -279,17 +285,36 @@ class CancelOnDisconnectMiddleware:
 
         queue: asyncio.Queue[Message] = asyncio.Queue(self.queue_size)
         response_complete = False
+        expects_trailers = False
 
         async def tee() -> Message:
             message = await receive()
-            await queue.put(message)
+            # The disconnect is terminal and must reach the watcher as a
+            # side-channel: queued behind body chunks on a bounded queue it
+            # could wait forever on a consumer that never comes.
+            if message["type"] != "http.disconnect":
+                await queue.put(message)
             return message
 
+        async def downstream_receive() -> Message:
+            # Replay the disconnect to downstream readers once the queue
+            # drains (e.g. response streams listening for disconnect).
+            if event.is_set() and queue.empty():
+                return {"type": "http.disconnect"}
+            return await queue.get()
+
         async def guarded_send(message: Message) -> None:
-            nonlocal response_complete
+            nonlocal response_complete, expects_trailers
             await send(message)
-            if message["type"] == "http.response.body" and not message.get("more_body"):
-                response_complete = True
+            match message["type"]:
+                case "http.response.start":
+                    expects_trailers = bool(message.get("trailers"))
+                case "http.response.body" if not message.get("more_body") and not expects_trailers:
+                    response_complete = True
+                case "http.response.trailers" if not message.get("more_trailers"):
+                    response_complete = True
+                case "http.response.pathsend":
+                    response_complete = True
 
         async def premature_disconnect() -> None:
             await event.wait()
@@ -304,7 +329,7 @@ class CancelOnDisconnectMiddleware:
             _disconnect_event(scope, tee) as event,
             _scope_cancelled_when(premature_disconnect) as guard,
         ):
-            await self.app(scope, queue.get, guarded_send)
+            await self.app(scope, downstream_receive, guarded_send)
 
         if guard.cancelled_caught and self.on_disconnect is not None:
             outcome = self.on_disconnect(scope)

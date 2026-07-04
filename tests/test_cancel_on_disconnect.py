@@ -1,7 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Annotated, Any
 
 import anyio
 import pytest
@@ -519,6 +519,91 @@ async def test_middleware_bounded_queue() -> None:
     async with asyncio.timeout(2):
         await app(http_scope("POST", "/slow", body=payload), receive, send)
     assert cancelled.is_set()
+
+
+async def test_bounded_queue_detects_disconnect_without_body_consumer() -> None:
+    """Regression: on a bodyless GET nobody drains the queue, so a queued
+    disconnect message would wait behind the empty http.request forever.
+    The disconnect must bypass queue backpressure entirely."""
+    cancelled = asyncio.Event()
+    app = FastAPI()
+    app.add_middleware(CancelOnDisconnectMiddleware, queue_size=1)
+
+    @app.get("/")
+    async def handler() -> str:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "OK"
+
+    _, send = collector()
+    receive = scripted_receive([(0, body_message()), (0.05, DISCONNECT)])
+    async with asyncio.timeout(2):
+        await app(http_scope(), receive, send)
+
+    assert cancelled.is_set()
+
+
+async def test_decorator_recognizes_annotated_request_param() -> None:
+    """Regression: `Annotated[Request, ...]` must count as the handler's own
+    Request parameter, not trigger injection of a competing second one."""
+    cancelled = asyncio.Event()
+    seen: list[str] = []
+    app = FastAPI()
+
+    @app.get("/")
+    @cancel_on_disconnect
+    async def handler(request: Annotated[Request, "meta"]) -> str:
+        seen.append(request.url.path)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "OK"
+
+    sent, send = collector()
+    receive = scripted_receive([(0, body_message()), (0.05, DISCONNECT)])
+    async with asyncio.timeout(2):
+        await app(http_scope(), receive, send)
+
+    assert seen == ["/"]
+    assert cancelled.is_set()
+    assert sent[0]["status"] == 499
+
+
+async def test_middleware_recognizes_terminal_extensions() -> None:
+    """Regression: http.response.pathsend and trailers complete the response;
+    a disconnect after them is a normal close — no cancellation, no callback."""
+    seen: list[str] = []
+    finished = {"pathsend": False, "trailers": False}
+
+    async def pathsend_app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.pathsend", "path": "/tmp/file"})
+        await asyncio.sleep(0.2)  # post-response work, like a background task
+        finished["pathsend"] = True
+
+    async def trailers_app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
+        await send({"type": "http.response.body", "body": b"x", "more_body": False})
+        await send({"type": "http.response.trailers", "headers": [], "more_trailers": False})
+        await asyncio.sleep(0.2)
+        finished["trailers"] = True
+
+    for name, asgi_app in (("pathsend", pathsend_app), ("trailers", trailers_app)):
+        middleware = CancelOnDisconnectMiddleware(
+            asgi_app, on_disconnect=lambda scope: seen.append(scope["path"])
+        )
+        _, send = collector()
+        receive = scripted_receive([(0, body_message()), (0.05, DISCONNECT)])
+        async with asyncio.timeout(2):
+            await middleware(http_scope(path=f"/{name}"), receive, send)
+
+    assert finished == {"pathsend": True, "trailers": True}
+    assert seen == []  # on_disconnect never fired for a completed response
 
 
 async def test_decorator_direct_call_runs_unguarded() -> None:
